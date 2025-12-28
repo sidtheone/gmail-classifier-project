@@ -36,144 +36,59 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# Anthropic API
+# AI APIs
 import anthropic
+import google.generativeai as genai
 
 # Local imports
+import config
 from config import (
     GMAIL_SCOPES,
     CREDENTIALS_FILE,
     TOKEN_FILE,
     BATCH_SIZE,
+    AI_BATCH_SIZE,
     MAX_BODY_LENGTH,
-    AI_MODEL,
+    AI_PROVIDER,
+    ANTHROPIC_MODEL,
+    GEMINI_MODEL,
     AI_MAX_TOKENS,
     CONFIDENCE_THRESHOLD,
     VERIFICATION_THRESHOLD,
     API_DELAY,
     MAX_RETRIES,
     INITIAL_BACKOFF,
+    RATE_LIMIT_BACKOFF,
+    RATE_LIMIT_TPM,
+    RATE_LIMIT_RPM,
+    RATE_LIMIT_RPD,
     SENDER_CACHE_FILE,
     PROGRESS_FILE,
     SUMMARY_FILE,
     PROMOTIONAL_SENDER_PATTERNS,
+    COSTS,
+    PROTECTED_DOMAINS,
+    PROTECTED_DOMAIN_PATTERNS,
 )
 from keyword_matcher import KeywordMatcher
+from decision_engine import EmailCategory, DecisionEngine, DeletionDecision
+from domain_checker import DomainChecker
+from gmail_client import GmailService
 
 
-# =============================================================================
-# GMAIL API INTEGRATION
-# =============================================================================
-
-class GmailService:
-    """Handles Gmail API authentication and operations."""
-
-    def __init__(self, project_dir: str):
-        self.project_dir = project_dir
-        self.credentials_path = os.path.join(project_dir, CREDENTIALS_FILE)
-        self.token_path = os.path.join(project_dir, TOKEN_FILE)
-        self.service = None
-
-    def authenticate(self) -> bool:
-        """Authenticate with Gmail API using OAuth 2.0."""
-        creds = None
-
-        # Load existing token
-        if os.path.exists(self.token_path):
-            with open(self.token_path, 'rb') as token:
-                creds = pickle.load(token)
-
-        # Refresh or get new credentials
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                try:
-                    creds.refresh(Request())
-                    print("  Token refreshed successfully")
-                except Exception as e:
-                    print(f"  Token refresh failed: {e}")
-                    creds = None
-
-            if not creds:
-                if not os.path.exists(self.credentials_path):
-                    print(f"\n  ERROR: {CREDENTIALS_FILE} not found!")
-                    print(f"  Please place your OAuth credentials at:")
-                    print(f"  {self.credentials_path}")
-                    return False
-
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    self.credentials_path, GMAIL_SCOPES
-                )
-                creds = flow.run_local_server(port=0)
-                print("  New authentication completed")
-
-            # Save token
-            with open(self.token_path, 'wb') as token:
-                pickle.dump(creds, token)
-
-        self.service = build('gmail', 'v1', credentials=creds)
-        return True
-
-    def get_messages(self, page_token: Optional[str] = None,
-                     max_results: int = 100) -> Tuple[List[Dict], Optional[str]]:
-        """Fetch messages from inbox with pagination."""
-        try:
-            results = self.service.users().messages().list(
-                userId='me',
-                labelIds=['INBOX'],
-                maxResults=max_results,
-                pageToken=page_token
-            ).execute()
-
-            messages = results.get('messages', [])
-            next_token = results.get('nextPageToken')
-            return messages, next_token
-
-        except HttpError as e:
-            if e.resp.status in [429, 500, 503]:
-                raise  # Let caller handle with backoff
-            raise
-
-    def get_message_details(self, msg_id: str) -> Optional[Dict]:
-        """Get full message details including headers and body."""
-        try:
-            message = self.service.users().messages().get(
-                userId='me',
-                id=msg_id,
-                format='full'
-            ).execute()
-            return message
-        except HttpError as e:
-            if e.resp.status == 404:
-                return None
-            raise
-
-    def trash_messages(self, message_ids: List[str]) -> int:
-        """Move messages to trash in batches."""
-        success_count = 0
-
-        for i in range(0, len(message_ids), 100):
-            batch = message_ids[i:i+100]
-
-            try:
-                body = {'ids': batch}
-                self.service.users().messages().batchModify(
-                    userId='me',
-                    body={'ids': batch, 'addLabelIds': ['TRASH']}
-                ).execute()
-                success_count += len(batch)
-            except HttpError as e:
-                print(f"  Error trashing batch: {e}")
-                # Try individual deletion
-                for msg_id in batch:
-                    try:
-                        self.service.users().messages().trash(
-                            userId='me', id=msg_id
-                        ).execute()
-                        success_count += 1
-                    except:
-                        pass
-
-        return success_count
+def debug_log(message: str, data: Any = None) -> None:
+    """Print debug message if DEBUG is enabled."""
+    if config.DEBUG:
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        print(f"  [DEBUG {timestamp}] {message}")
+        if data is not None:
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    val_str = str(value)[:100] + "..." if len(str(value)) > 100 else str(value)
+                    print(f"    {key}: {val_str}")
+            else:
+                data_str = str(data)[:200] + "..." if len(str(data)) > 200 else str(data)
+                print(f"    {data_str}")
 
 
 # =============================================================================
@@ -264,8 +179,8 @@ class SenderCache:
     def __init__(self, project_dir: str):
         self.cache_path = os.path.join(project_dir, SENDER_CACHE_FILE)
         self.cache = {
-            'promotional': {},      # {email: count}
-            'non_promotional': {}   # {email: count}
+            'version': '2.0',
+            'senders': {}  # {email: {category: count, ...}}
         }
         self.load()
 
@@ -274,7 +189,14 @@ class SenderCache:
         if os.path.exists(self.cache_path):
             try:
                 with open(self.cache_path, 'r') as f:
-                    self.cache = json.load(f)
+                    loaded = json.load(f)
+                    # Check version - if old v1 format, start fresh
+                    if loaded.get('version') == '2.0':
+                        self.cache = loaded
+                    else:
+                        # Old format detected - purge and start fresh
+                        print("  Old cache format detected - starting fresh")
+                        os.remove(self.cache_path)
             except (json.JSONDecodeError, IOError):
                 pass
 
@@ -283,33 +205,38 @@ class SenderCache:
         with open(self.cache_path, 'w') as f:
             json.dump(self.cache, f, indent=2)
 
-    def check(self, email: str) -> Optional[bool]:
-        """Check if sender is in cache. Returns is_promotional or None."""
+    def check(self, email: str) -> Optional[EmailCategory]:
+        """Check if sender is in cache. Returns EmailCategory or None."""
         email = email.lower()
 
-        # Check promotional patterns first
+        # Check promotional patterns first (return PROMOTIONAL category)
         for pattern in PROMOTIONAL_SENDER_PATTERNS:
             if re.match(pattern, email, re.IGNORECASE):
-                return True
+                return EmailCategory.PROMOTIONAL
 
-        # Check cache
-        promo_count = self.cache['promotional'].get(email, 0)
-        non_promo_count = self.cache['non_promotional'].get(email, 0)
+        # Check cache - return category if ≥80% threshold with 2+ emails
+        sender_data = self.cache['senders'].get(email, {})
+        total = sum(sender_data.values())
 
-        total = promo_count + non_promo_count
         if total >= 2:  # Need at least 2 emails to trust cache
-            if promo_count >= total * 0.8:
-                return True
-            elif non_promo_count >= total * 0.8:
-                return False
+            for category_str, count in sender_data.items():
+                if count >= total * 0.8:
+                    try:
+                        return EmailCategory(category_str)
+                    except ValueError:
+                        pass  # Invalid category, continue
 
         return None
 
-    def update(self, email: str, is_promotional: bool) -> None:
+    def update(self, email: str, category: EmailCategory) -> None:
         """Update cache with new classification."""
         email = email.lower()
-        key = 'promotional' if is_promotional else 'non_promotional'
-        self.cache[key][email] = self.cache[key].get(email, 0) + 1
+
+        if email not in self.cache['senders']:
+            self.cache['senders'][email] = {}
+
+        cat_str = category.value if isinstance(category, EmailCategory) else str(category)
+        self.cache['senders'][email][cat_str] = self.cache['senders'][email].get(cat_str, 0) + 1
 
 
 # =============================================================================
@@ -317,25 +244,23 @@ class SenderCache:
 # =============================================================================
 
 class AIClassifier:
-    """Dual-agent AI classification system using Claude."""
+    """Dual-agent AI classification system supporting Anthropic and Gemini."""
 
-    CLASSIFIER_PROMPT = """You are an email classifier. Analyze this email and determine if it's promotional.
+    CLASSIFIER_PROMPT = """You are an email classifier. Classify this email into ONE of these 5 categories:
 
-PROMOTIONAL emails include:
-- Marketing newsletters, product announcements
-- Sales, discounts, deals, coupons (Angebote, Rabatte, Gutscheine)
-- Promotional content from brands/stores
-- Social media notifications (LinkedIn, Facebook updates)
-- Automated marketing emails
+1. PROMOTIONAL: Marketing newsletters, sales, discounts, product announcements, social media notifications, automated marketing
 
-NON-PROMOTIONAL emails include:
-- Personal correspondence
-- Transaction receipts/confirmations (Quittungen)
-- Shipping notifications (Versandbestätigung)
-- Account security alerts
-- Work/business communications
-- Bills and statements
-- Appointment confirmations
+2. TRANSACTIONAL: Purchase receipts, shipping confirmations, delivery updates, payment confirmations, order status
+
+3. SYSTEM_SECURITY: Account alerts, password resets, security notifications, login alerts, verification codes, 2FA
+
+4. SOCIAL_PLATFORM: Social network updates, friend requests, mentions, comments (Facebook, LinkedIn, Twitter)
+
+5. PERSONAL_HUMAN: Direct human correspondence, work emails, personal messages, meeting invites from real people
+
+CRITICAL: Investment platforms (banks, brokerages, mutual funds, stock exchanges) are NEVER promotional!
+- Examples: Zerodha, Groww, SBIMF, Schwab, Fidelity, Vanguard, ICICI Direct
+- These should be classified as TRANSACTIONAL or SYSTEM_SECURITY
 
 Email details:
 Subject: {subject}
@@ -343,7 +268,7 @@ From: {sender}
 Body preview: {body}
 
 Respond ONLY with valid JSON (no markdown):
-{{"is_promotional": true/false, "confidence": 0-100, "reason": "brief explanation"}}"""
+{{"category": "promotional|transactional|system_security|social_platform|personal_human", "confidence": 0-100, "reason": "brief explanation"}}"""
 
     VERIFIER_PROMPT = """You are a classification verifier. Review this email classification.
 
@@ -356,78 +281,256 @@ Subject: {subject}
 From: {sender}
 Body preview: {body}
 
+CRITICAL: Investment platform emails (banks, brokerages, mutual funds) should NEVER be promotional!
+- Examples: Zerodha, Groww, SBIMF, Schwab, Fidelity, Vanguard, ICICI Direct, Upstox
+- These should be TRANSACTIONAL or SYSTEM_SECURITY, NOT promotional
+
 Common false positives to catch:
 - Transaction receipts mistaken for promotions
 - Shipping confirmations from retail stores
+- Investment platform updates mistaken for promotions (CRITICAL!)
 - Account statements from financial services
 - Personal emails from business domains
 
 Common false negatives to catch:
 - Promotional newsletters with personal greetings
 - "You might like" recommendations
-- Loyalty program updates
+- Loyalty program marketing updates
 - Social media digest emails
 
-Respond ONLY with valid JSON (no markdown):
-{{"classification_correct": true/false, "confidence": 0-100, "corrected_reason": "explanation if corrected"}}"""
+Categories: promotional, transactional, system_security, social_platform, personal_human
 
-    def __init__(self, api_key: str):
-        self.client = anthropic.Anthropic(api_key=api_key)
+Respond ONLY with valid JSON (no markdown):
+{{"classification_correct": true/false, "corrected_category": "category if corrected", "confidence": 0-100, "corrected_reason": "explanation if corrected"}}"""
+
+    def __init__(self, api_key: str, provider: str = AI_PROVIDER):
+        self.provider = provider
+        self.api_key = api_key
+
+        if provider == 'anthropic':
+            self.client = anthropic.Anthropic(api_key=api_key)
+        elif provider == 'gemini':
+            genai.configure(api_key=api_key)
+            self.client = genai.GenerativeModel(GEMINI_MODEL)
+        else:
+            raise ValueError(f"Unknown provider: {provider}")
+
         self.stats = {
             'primary_calls': 0,
             'verification_calls': 0,
             'corrections': 0,
             'cache_hits': 0,
             'input_tokens': 0,
-            'output_tokens': 0
+            'output_tokens': 0,
+            'rate_limit_hits': 0
         }
         self.last_call_time = 0
 
+        # Rate limiting tracking
+        self.minute_start_time = time.time()
+        self.tokens_this_minute = 0
+        self.requests_this_minute = 0
+        self.requests_today = 0
+        self.day_start_time = time.time()
+
     def _rate_limit(self) -> None:
         """Enforce rate limiting between API calls."""
+        current_time = time.time()
+
+        # Reset daily counter if a day has passed
+        if current_time - self.day_start_time >= 86400:  # 24 hours
+            self.requests_today = 0
+            self.day_start_time = current_time
+            debug_log("Rate limit: Daily counter reset")
+
+        # Reset minute counters if a minute has passed
+        if current_time - self.minute_start_time >= 60:
+            self.tokens_this_minute = 0
+            self.requests_this_minute = 0
+            self.minute_start_time = current_time
+            debug_log("Rate limit: Minute counter reset")
+
+        # Check daily limit (RPD)
+        if self.requests_today >= RATE_LIMIT_RPD:
+            wait_time = 86400 - (current_time - self.day_start_time)
+            print(f"\n  Daily request limit reached ({RATE_LIMIT_RPD}). Waiting {wait_time/3600:.1f} hours...")
+            time.sleep(wait_time)
+            self.requests_today = 0
+            self.day_start_time = time.time()
+            self.tokens_this_minute = 0
+            self.requests_this_minute = 0
+            self.minute_start_time = time.time()
+
+        # Check requests per minute (RPM)
+        if self.requests_this_minute >= RATE_LIMIT_RPM:
+            wait_time = 60 - (current_time - self.minute_start_time)
+            if wait_time > 0:
+                debug_log(f"Rate limit: RPM limit hit, waiting {wait_time:.1f}s")
+                print(f"\n  RPM limit reached ({RATE_LIMIT_RPM}/min). Waiting {wait_time:.1f}s...")
+                time.sleep(wait_time)
+                self.tokens_this_minute = 0
+                self.requests_this_minute = 0
+                self.minute_start_time = time.time()
+
+        # Check tokens per minute (TPM)
+        if self.tokens_this_minute >= RATE_LIMIT_TPM:
+            wait_time = 60 - (current_time - self.minute_start_time)
+            if wait_time > 0:
+                debug_log(f"Rate limit: TPM limit hit ({self.tokens_this_minute}/{RATE_LIMIT_TPM}), waiting {wait_time:.1f}s")
+                print(f"\n  TPM limit reached ({self.tokens_this_minute}/{RATE_LIMIT_TPM}). Waiting {wait_time:.1f}s...")
+                time.sleep(wait_time)
+                self.tokens_this_minute = 0
+                self.requests_this_minute = 0
+                self.minute_start_time = time.time()
+
+        # Enforce minimum delay between calls
         elapsed = time.time() - self.last_call_time
         if elapsed < API_DELAY:
             time.sleep(API_DELAY - elapsed)
+
         self.last_call_time = time.time()
 
-    def _call_api(self, prompt: str, retries: int = 0) -> Optional[Dict]:
-        """Make API call with exponential backoff."""
-        self._rate_limit()
-
+    def _call_anthropic(self, prompt: str, retries: int = 0) -> Optional[Dict]:
+        """Make Anthropic API call."""
+        debug_log(f"Anthropic API: Calling {ANTHROPIC_MODEL}", {
+            "retry": retries,
+            "prompt_length": len(prompt)
+        })
         try:
             response = self.client.messages.create(
-                model=AI_MODEL,
+                model=ANTHROPIC_MODEL,
                 max_tokens=AI_MAX_TOKENS,
                 messages=[{"role": "user", "content": prompt}]
             )
-
-            # Track tokens
             self.stats['input_tokens'] += response.usage.input_tokens
             self.stats['output_tokens'] += response.usage.output_tokens
+            result = response.content[0].text.strip()
+            debug_log(f"Anthropic API: Success", {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "response": result[:100]
+            })
+            return result
 
-            # Parse JSON response
-            content = response.content[0].text.strip()
-
-            # Handle potential markdown wrapping
-            if content.startswith('```'):
-                lines = content.split('\n')
-                content = '\n'.join(lines[1:-1] if lines[-1] == '```' else lines[1:])
-
-            return json.loads(content)
-
-        except anthropic.RateLimitError:
+        except anthropic.RateLimitError as e:
+            debug_log(f"Anthropic API: Rate limit error", {
+                "error": str(e),
+                "retry": retries
+            })
             if retries < MAX_RETRIES:
                 backoff = INITIAL_BACKOFF * (2 ** retries)
                 print(f"\n  Rate limited, waiting {backoff:.1f}s...")
                 time.sleep(backoff)
-                return self._call_api(prompt, retries + 1)
+                return self._call_anthropic(prompt, retries + 1)
             raise
+        except Exception as e:
+            debug_log(f"Anthropic API: Error", {
+                "error_type": type(e).__name__,
+                "error": str(e),
+                "retry": retries
+            })
+            raise
+
+    def _call_gemini(self, prompt: str, retries: int = 0) -> Optional[str]:
+        """Make Gemini API call."""
+        debug_log(f"Gemini API: Calling {GEMINI_MODEL}", {
+            "retry": retries,
+            "prompt_length": len(prompt)
+        })
+        try:
+            # Increment request counters before call
+            self.requests_this_minute += 1
+            self.requests_today += 1
+
+            response = self.client.generate_content(prompt)
+
+            # Track tokens (Gemini doesn't always return exact counts)
+            if hasattr(response, 'usage_metadata'):
+                input_tokens = getattr(response.usage_metadata, 'prompt_token_count', 0)
+                output_tokens = getattr(response.usage_metadata, 'candidates_token_count', 0)
+            else:
+                # Rough estimate: 4 chars per token
+                input_tokens = len(prompt) // 4
+                output_tokens = len(response.text) // 4
+
+            # Update stats
+            self.stats['input_tokens'] += input_tokens
+            self.stats['output_tokens'] += output_tokens
+
+            # Update TPM counter
+            total_tokens = input_tokens + output_tokens
+            self.tokens_this_minute += total_tokens
+
+            result = response.text.strip()
+            debug_log(f"Gemini API: Success", {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "tokens_this_minute": self.tokens_this_minute,
+                "requests_this_minute": self.requests_this_minute,
+                "response": result[:100]
+            })
+            return result
+
+        except Exception as e:
+            error_str = str(e)
+            debug_log(f"Gemini API: Error", {
+                "error_type": type(e).__name__,
+                "error": error_str[:200],
+                "retry": retries
+            })
+            if 'quota' in error_str.lower() or 'rate' in error_str.lower() or '429' in error_str:
+                self.stats['rate_limit_hits'] += 1
+                if retries < MAX_RETRIES:
+                    print(f"\n  ⚠️  Rate limited! Waiting {RATE_LIMIT_BACKOFF:.0f}s before retry {retries + 1}/{MAX_RETRIES}...")
+                    time.sleep(RATE_LIMIT_BACKOFF)
+                    # Reset counters after wait
+                    self.tokens_this_minute = 0
+                    self.requests_this_minute = 0
+                    self.minute_start_time = time.time()
+                    return self._call_gemini(prompt, retries + 1)
+            raise
+
+    def _call_api(self, prompt: str, retries: int = 0) -> Optional[Dict]:
+        """Make API call with exponential backoff."""
+        self._rate_limit()
+        debug_log(f"AI API: Starting call", {"provider": self.provider})
+
+        try:
+            if self.provider == 'anthropic':
+                content = self._call_anthropic(prompt, retries)
+            else:
+                content = self._call_gemini(prompt, retries)
+
+            if content is None:
+                debug_log("AI API: Received None response")
+                return None
+
+            # Handle potential markdown wrapping
+            if content.startswith('```'):
+                debug_log("AI API: Stripping markdown wrapper")
+                lines = content.split('\n')
+                content = '\n'.join(lines[1:-1] if lines[-1] == '```' else lines[1:])
+
+            result = json.loads(content)
+            debug_log(f"AI API: Parsed JSON successfully", result)
+            return result
+
         except json.JSONDecodeError as e:
+            debug_log(f"AI API: JSON parse error", {
+                "error": str(e),
+                "content": content[:200] if content else "None"
+            })
             print(f"\n  JSON parse error: {e}")
             return None
         except Exception as e:
+            debug_log(f"AI API: Exception", {
+                "error_type": type(e).__name__,
+                "error": str(e)[:200],
+                "retry": retries
+            })
             if retries < MAX_RETRIES:
                 backoff = INITIAL_BACKOFF * (2 ** retries)
+                debug_log(f"AI API: Retrying after {backoff}s")
                 time.sleep(backoff)
                 return self._call_api(prompt, retries + 1)
             raise
@@ -446,14 +549,21 @@ Respond ONLY with valid JSON (no markdown):
 
         if result is None:
             return {
-                'is_promotional': False,
+                'category': EmailCategory.PERSONAL_HUMAN,  # Safe default
                 'confidence': 0,
                 'reason': 'Classification failed',
                 'verified': False
             }
 
+        # Convert string category to enum
+        category_str = result.get('category', 'personal_human')
+        try:
+            category = EmailCategory(category_str)
+        except ValueError:
+            category = EmailCategory.PERSONAL_HUMAN  # Safe default
+
         return {
-            'is_promotional': result.get('is_promotional', False),
+            'category': category,
             'confidence': result.get('confidence', 50),
             'reason': result.get('reason', 'Unknown'),
             'verified': False
@@ -463,8 +573,15 @@ Respond ONLY with valid JSON (no markdown):
         """Secondary verification using Agent 2."""
         self.stats['verification_calls'] += 1
 
+        # Get category as string for prompt
+        category = classification.get('category')
+        if isinstance(category, EmailCategory):
+            category_str = category.value
+        else:
+            category_str = str(category)
+
         prompt = self.VERIFIER_PROMPT.format(
-            classification='promotional' if classification['is_promotional'] else 'non-promotional',
+            classification=category_str,
             confidence=classification['confidence'],
             reason=classification['reason'],
             subject=email_content['subject'][:200],
@@ -480,8 +597,16 @@ Respond ONLY with valid JSON (no markdown):
 
         if not result.get('classification_correct', True):
             self.stats['corrections'] += 1
+
+            # Get corrected category
+            corrected_cat_str = result.get('corrected_category', category_str)
+            try:
+                corrected_category = EmailCategory(corrected_cat_str)
+            except ValueError:
+                corrected_category = classification['category']  # Keep original if invalid
+
             return {
-                'is_promotional': not classification['is_promotional'],
+                'category': corrected_category,
                 'confidence': result.get('confidence', classification['confidence']),
                 'reason': result.get('corrected_reason', classification['reason']),
                 'verified': True,
@@ -503,6 +628,167 @@ Respond ONLY with valid JSON (no markdown):
 
         return result
 
+    def batch_classify(self, email_list: List[Dict]) -> List[Dict]:
+        """
+        Batch classification - classify multiple emails in a single API call.
+
+        Args:
+            email_list: List of email content dicts with keys: subject, sender, body, msg_id
+
+        Returns:
+            List of classification dicts matching the order of input emails
+        """
+        if not email_list:
+            return []
+
+        self.stats['primary_calls'] += 1  # Count as one API call
+
+        # Build compact batch prompt
+        batch_prompt = """You are an email classifier. Classify these emails into categories.
+
+Categories: promotional, transactional, system_security, social_platform, personal_human
+
+CRITICAL: Investment platforms (banks, brokerages, mutual funds) are NEVER promotional!
+
+Emails to classify:
+"""
+
+        for idx, email in enumerate(email_list):
+            batch_prompt += f"""
+{idx}. Subject: {email['subject'][:150]}
+   From: {email['sender'][:80]}
+   Preview: {email['body'][:200]}
+"""
+
+        batch_prompt += """
+Respond with ONLY a JSON array (no markdown) where each object has:
+{"idx": number, "cat": "category", "c": 0-100 (confidence)}
+
+Example: [{"idx":0,"cat":"promotional","c":85},{"idx":1,"cat":"transactional","c":90}]"""
+
+        result = self._call_api(batch_prompt)
+
+        if result is None or not isinstance(result, list):
+            # Fallback: mark all as personal_human (safe default) with low confidence
+            debug_log("Batch classification failed, using fallback")
+            return [{
+                'category': EmailCategory.PERSONAL_HUMAN,
+                'confidence': 0,
+                'reason': 'Batch classification failed',
+                'verified': False
+            } for _ in email_list]
+
+        # Convert compact format to full format
+        classifications = []
+        for item in result:
+            idx = item.get('idx', 0)
+            category_str = item.get('cat', 'personal_human')
+
+            # Convert string to enum
+            try:
+                category = EmailCategory(category_str)
+            except ValueError:
+                category = EmailCategory.PERSONAL_HUMAN  # Safe default
+
+            classifications.append({
+                'category': category,
+                'confidence': item.get('c', 50),
+                'reason': f'Batch classified (#{idx})',
+                'verified': False
+            })
+
+        debug_log(f"Batch classified {len(classifications)} emails")
+        return classifications
+
+    def batch_verify(self, email_list: List[Dict], classifications: List[Dict]) -> List[Dict]:
+        """
+        Batch verification - verify multiple classifications in a single API call.
+
+        Args:
+            email_list: List of email content dicts
+            classifications: List of classification results to verify
+
+        Returns:
+            List of verified/corrected classification dicts
+        """
+        if not email_list or not classifications:
+            return classifications
+
+        self.stats['verification_calls'] += 1
+
+        # Build compact batch verification prompt
+        batch_prompt = """You are a classification verifier. Review these email classifications and correct any errors.
+
+CRITICAL: Investment platforms (banks, brokerages, mutual funds) should NEVER be promotional!
+
+Common errors to catch:
+- Investment platform updates mistaken for promotions (CRITICAL!)
+- Receipts/shipping confirmations mistaken for promotions
+- Newsletter-style promotional content marked incorrectly
+
+Classifications to verify:
+"""
+
+        for idx, (email, cls) in enumerate(zip(email_list, classifications)):
+            category = cls.get('category')
+            if isinstance(category, EmailCategory):
+                cat_str = category.value
+            else:
+                cat_str = str(category)
+
+            batch_prompt += f"""
+{idx}. [{cat_str.upper()}] Conf:{cls['confidence']}% - {email['sender'][:60]}
+   "{email['subject'][:100]}"
+"""
+
+        batch_prompt += """
+Respond with ONLY a JSON array (no markdown) for emails that need correction:
+[{"idx": number, "cat": "corrected_category", "c": 0-100}]
+
+Categories: promotional, transactional, system_security, social_platform, personal_human
+
+If no corrections needed, return empty array: []"""
+
+        result = self._call_api(batch_prompt)
+
+        if result is None:
+            # No corrections, mark all as verified
+            for cls in classifications:
+                cls['verified'] = True
+            return classifications
+
+        # Apply corrections
+        corrected_indices = set()
+        if isinstance(result, list):
+            for correction in result:
+                idx = correction.get('idx', -1)
+                if 0 <= idx < len(classifications):
+                    corrected_indices.add(idx)
+                    self.stats['corrections'] += 1
+
+                    # Parse corrected category
+                    cat_str = correction.get('cat', 'personal_human')
+                    try:
+                        corrected_category = EmailCategory(cat_str)
+                    except ValueError:
+                        corrected_category = classifications[idx].get('category', EmailCategory.PERSONAL_HUMAN)
+
+                    classifications[idx] = {
+                        'category': corrected_category,
+                        'confidence': correction.get('c', classifications[idx]['confidence']),
+                        'reason': f'Batch corrected (#{idx})',
+                        'verified': True,
+                        'corrected': True
+                    }
+
+        # Mark non-corrected as verified
+        for idx, cls in enumerate(classifications):
+            if idx not in corrected_indices:
+                cls['verified'] = True
+
+        debug_log(f"Batch verified {len(classifications)} emails, corrected {len(corrected_indices)}")
+        return classifications
+
 
 # =============================================================================
 # PROGRESS TRACKING
@@ -515,10 +801,17 @@ class ProgressTracker:
         self.progress_path = os.path.join(project_dir, PROGRESS_FILE)
         self.summary_path = os.path.join(project_dir, SUMMARY_FILE)
         self.progress = {
+            'version': '2.0',
             'processed_ids': [],
             'page_token': None,
-            'promotional_emails': [],  # List of {id, subject, sender, confidence}
-            'non_promotional_count': 0,
+            'emails': [],  # List of all emails with category, subject, sender, confidence
+            'category_counts': {
+                'promotional': 0,
+                'transactional': 0,
+                'system_security': 0,
+                'social_platform': 0,
+                'personal_human': 0
+            },
             'started_at': None,
             'last_updated': None,
             'batches_completed': 0
@@ -531,8 +824,15 @@ class ProgressTracker:
             try:
                 with open(self.progress_path, 'r') as f:
                     saved = json.load(f)
-                    self.progress.update(saved)
-                    return bool(saved.get('processed_ids'))
+                    # Check version - if old v1 format, start fresh
+                    if saved.get('version') == '2.0':
+                        self.progress.update(saved)
+                        return bool(saved.get('processed_ids'))
+                    else:
+                        # Old format detected - purge and start fresh
+                        print("  Old progress format detected - starting fresh")
+                        os.remove(self.progress_path)
+                        return False
             except (json.JSONDecodeError, IOError):
                 pass
         return False
@@ -552,18 +852,28 @@ class ProgressTracker:
         """Record classification result."""
         self.progress['processed_ids'].append(msg_id)
 
-        if classification['is_promotional']:
-            self.progress['promotional_emails'].append({
-                'id': msg_id,
-                'subject': email_content['subject'][:100],
-                'sender': email_content['sender'],
-                'email': email_content['email'],
-                'confidence': classification['confidence'],
-                'verified': classification.get('verified', False),
-                'corrected': classification.get('corrected', False)
-            })
+        # Get category
+        category = classification.get('category')
+        if isinstance(category, EmailCategory):
+            cat_str = category.value
         else:
-            self.progress['non_promotional_count'] += 1
+            cat_str = str(category) if category else 'personal_human'
+
+        # Add to emails list
+        self.progress['emails'].append({
+            'id': msg_id,
+            'category': cat_str,
+            'subject': email_content['subject'][:100],
+            'sender': email_content['sender'],
+            'email': email_content['email'],
+            'confidence': classification['confidence'],
+            'verified': classification.get('verified', False),
+            'corrected': classification.get('corrected', False)
+        })
+
+        # Update category counts
+        if cat_str in self.progress['category_counts']:
+            self.progress['category_counts'][cat_str] += 1
 
     def update_page_token(self, token: Optional[str]) -> None:
         """Update pagination token."""
@@ -575,22 +885,26 @@ class ProgressTracker:
         self.save()
 
     def get_summary(self) -> Dict:
-        """Generate sender summary from promotional emails."""
+        """Generate sender summary from all emails."""
         sender_groups = defaultdict(list)
 
-        for email in self.progress['promotional_emails']:
+        # Group promotional emails by sender for detailed summary
+        promotional_emails = [e for e in self.progress['emails']
+                            if e.get('category') == 'promotional']
+
+        for email in promotional_emails:
             sender_groups[email['email']].append(email)
 
         summary = {
             'total_processed': len(self.progress['processed_ids']),
-            'promotional_count': len(self.progress['promotional_emails']),
-            'non_promotional_count': self.progress['non_promotional_count'],
-            'senders': {}
+            'category_counts': self.progress['category_counts'].copy(),
+            'promotional_senders': {}
         }
 
+        # Build sender details for promotional senders
         for sender, emails in sorted(sender_groups.items(),
                                      key=lambda x: -len(x[1])):
-            summary['senders'][sender] = {
+            summary['promotional_senders'][sender] = {
                 'count': len(emails),
                 'emails': [e['id'] for e in emails],
                 'avg_confidence': sum(e['confidence'] for e in emails) / len(emails),
@@ -627,12 +941,14 @@ class ProgressTracker:
 class GmailClassifier:
     """Main orchestrator for the email classification system."""
 
-    def __init__(self, project_dir: str, anthropic_key: str):
+    def __init__(self, project_dir: str, api_key: str, provider: str = AI_PROVIDER):
         self.project_dir = project_dir
+        self.provider = provider
         self.gmail = GmailService(project_dir)
         self.cache = SenderCache(project_dir)
+        self.domain_checker = DomainChecker()
         self.keyword_matcher = KeywordMatcher()
-        self.classifier = AIClassifier(anthropic_key)
+        self.classifier = AIClassifier(api_key, provider)
         self.progress = ProgressTracker(project_dir)
 
     def initialize(self) -> bool:
@@ -657,7 +973,8 @@ class GmailClassifier:
             self.progress.progress['started_at'] = datetime.now().isoformat()
 
         print("\n[2/4] Processing inbox...")
-        print("  Legend: 💾=cached 🔑=keyword 🔍=verified ✏️=corrected ✓=promo ✗=not-promo")
+        print("  Legend: 🛡️=protected 🔍=verified ✏️=corrected ✓=promo ✗=not-promo")
+        print("  Note: Cache disabled - classifying each email fresh for audit")
         print()
 
         page_token = self.progress.progress.get('page_token')
@@ -684,6 +1001,11 @@ class GmailClassifier:
                 print(f"\n  Batch {batch_num}: ", end="", flush=True)
 
                 batch_processed = 0
+
+                # Phase 1: Collect and pre-filter emails
+                emails_to_classify = []
+                email_metadata = []  # Track msg_id and email_content for each
+
                 for msg in messages:
                     msg_id = msg['id']
 
@@ -698,70 +1020,110 @@ class GmailClassifier:
 
                     email_content = EmailParser.get_email_content(details)
 
-                    # Check cache first
-                    cached_result = None
-                    if use_cache:
-                        cached_result = self.cache.check(email_content['email'])
+                    debug_log(f"Processing email", {
+                        "msg_id": msg_id,
+                        "from": email_content['email'],
+                        "subject": email_content['subject'][:50]
+                    })
 
-                    if cached_result is not None:
-                        # Use cached classification
-                        self.classifier.stats['cache_hits'] += 1
+                    # Check protected domains FIRST
+                    is_protected, protection_reason = self.domain_checker.is_protected(
+                        email_content['email']
+                    )
+
+                    if is_protected:
                         classification = {
-                            'is_promotional': cached_result,
-                            'confidence': 95,
-                            'reason': 'Cached sender',
+                            'category': EmailCategory.PERSONAL_HUMAN,  # Protected domains classified as safe
+                            'confidence': 100,
+                            'reason': protection_reason,
                             'verified': True,
-                            'cached': True
+                            'protected': True
                         }
-                        print("💾", end="", flush=True)
-                    else:
-                        # Check keywords before AI classification
-                        keyword_result, match_count, matched_keywords = \
-                            self.keyword_matcher.check(email_content)
+                        print("🛡️", end="", flush=True)
+                        self.progress.add_result(msg_id, email_content, classification)
+                        batch_processed += 1
+                        processed += 1
+                        if max_total and processed >= max_total:
+                            break
+                        continue
 
-                        if keyword_result is not None:
-                            # Keyword match found - classify as promotional
-                            self.classifier.stats['keyword_hits'] = \
-                                self.classifier.stats.get('keyword_hits', 0) + 1
-                            classification = {
-                                'is_promotional': True,
-                                'confidence': min(70 + match_count * 5, 95),
-                                'reason': f'Keyword match ({match_count}): {", ".join(matched_keywords[:3])}',
-                                'verified': True,
-                                'keyword_match': True
-                            }
-                            print("🔑", end="", flush=True)
+                    # Cache disabled - classify each email fresh for audit
+                    # (User request: "Don't use cache, classify each email")
+                    # Skip cache check entirely
 
-                            # Update cache with keyword result
-                            self.cache.update(email_content['email'], True)
-                        else:
-                            # AI classification
-                            classification = self.classifier.classify_with_verification(
-                                email_content, verify_low_confidence
-                            )
+                    # Keywords disabled - classify each email with AI for consistent audit
+                    # (User request: "classify each email")
+                    # Skip keyword matching
 
-                            # Update cache
+                    # Need AI classification - add to batch
+                    emails_to_classify.append({
+                        'subject': email_content['subject'],
+                        'sender': email_content['sender'],
+                        'body': email_content['body'],
+                        'msg_id': msg_id
+                    })
+                    email_metadata.append((msg_id, email_content))
+
+                # Phase 2: Batch classify remaining emails
+                if emails_to_classify:
+                    debug_log(f"Batch classifying {len(emails_to_classify)} emails")
+
+                    # Process in sub-batches of AI_BATCH_SIZE
+                    for i in range(0, len(emails_to_classify), AI_BATCH_SIZE):
+                        sub_batch = emails_to_classify[i:i + AI_BATCH_SIZE]
+                        sub_metadata = email_metadata[i:i + AI_BATCH_SIZE]
+
+                        # Batch classify
+                        classifications = self.classifier.batch_classify(sub_batch)
+
+                        # CRITICAL: ALWAYS verify promotional emails (safety-first)
+                        # Also verify low-confidence classifications for other categories
+                        verify_indices = []
+                        for idx, cls in enumerate(classifications):
+                            # ALWAYS verify promotional (regardless of confidence)
+                            if cls.get('category') == EmailCategory.PROMOTIONAL:
+                                verify_indices.append(idx)
+                            # Verify other categories if low confidence
+                            elif verify_low_confidence and cls['confidence'] < VERIFICATION_THRESHOLD:
+                                verify_indices.append(idx)
+
+                        if verify_indices:
+                            verify_emails = [sub_batch[idx] for idx in verify_indices]
+                            verify_cls = [classifications[idx] for idx in verify_indices]
+
+                            verified_cls = self.classifier.batch_verify(verify_emails, verify_cls)
+
+                            # Update classifications with verified results
+                            for idx, verified in zip(verify_indices, verified_cls):
+                                classifications[idx] = verified
+
+                        # Record results
+                        for (msg_id, email_content), classification in zip(sub_metadata, classifications):
+                            # Cache disabled - but still save for audit trail
                             self.cache.update(email_content['email'],
-                                             classification['is_promotional'])
+                                            classification['category'])
 
-                            # Print indicator (only for AI classification)
+                            # Print indicator
+                            category = classification.get('category')
                             if classification.get('corrected'):
                                 print("✏️", end="", flush=True)
                             elif classification.get('verified'):
                                 print("🔍", end="", flush=True)
-                            elif classification['is_promotional']:
+                            elif category == EmailCategory.PROMOTIONAL:
                                 print("✓", end="", flush=True)
                             else:
                                 print("✗", end="", flush=True)
 
-                    # Record result
-                    self.progress.add_result(msg_id, email_content, classification)
+                            # Record result
+                            self.progress.add_result(msg_id, email_content, classification)
+                            batch_processed += 1
+                            processed += 1
 
-                    batch_processed += 1
-                    processed += 1
+                            if max_total and processed >= max_total:
+                                break
 
-                    if max_total and processed >= max_total:
-                        break
+                        if max_total and processed >= max_total:
+                            break
 
                 # Save progress after each batch
                 self.progress.update_page_token(next_token)
@@ -769,7 +1131,7 @@ class GmailClassifier:
                 self.cache.save()
 
                 # Print batch stats
-                promo_count = len(self.progress.progress['promotional_emails'])
+                promo_count = self.progress.progress['category_counts']['promotional']
                 elapsed = time.time() - start_time
                 rate = processed / elapsed if elapsed > 0 else 0
                 print(f" [{batch_processed}] Total: {processed} | Promo: {promo_count} | "
@@ -799,6 +1161,7 @@ class GmailClassifier:
         results = {
             'summary': summary,
             'ai_stats': self.classifier.stats,
+            'domain_stats': self.domain_checker.stats,
             'estimated_cost': self._estimate_cost()
         }
 
@@ -806,14 +1169,13 @@ class GmailClassifier:
 
     def _estimate_cost(self) -> Dict:
         """Estimate API costs based on token usage."""
-        # Claude Haiku pricing (as of 2024)
-        INPUT_COST_PER_M = 0.25   # $0.25 per million input tokens
-        OUTPUT_COST_PER_M = 1.25  # $1.25 per million output tokens
+        cost_rates = COSTS.get(self.provider, COSTS['gemini'])
 
-        input_cost = (self.classifier.stats['input_tokens'] / 1_000_000) * INPUT_COST_PER_M
-        output_cost = (self.classifier.stats['output_tokens'] / 1_000_000) * OUTPUT_COST_PER_M
+        input_cost = (self.classifier.stats['input_tokens'] / 1_000_000) * cost_rates['input']
+        output_cost = (self.classifier.stats['output_tokens'] / 1_000_000) * cost_rates['output']
 
         return {
+            'provider': self.provider,
             'input_tokens': self.classifier.stats['input_tokens'],
             'output_tokens': self.classifier.stats['output_tokens'],
             'input_cost': f"${input_cost:.4f}",
@@ -823,7 +1185,9 @@ class GmailClassifier:
 
     def delete_promotional(self, dry_run: bool = True) -> Dict:
         """Delete promotional emails after user confirmation."""
-        promo_emails = self.progress.progress['promotional_emails']
+        # Filter promotional emails
+        promo_emails = [e for e in self.progress.progress['emails']
+                       if e.get('category') == 'promotional']
 
         if not promo_emails:
             print("  No promotional emails to delete")
@@ -886,6 +1250,7 @@ def print_results(results: Dict):
     """Print classification results."""
     summary = results['summary']
     stats = results['ai_stats']
+    domain_stats = results.get('domain_stats', {})
     cost = results['estimated_cost']
 
     print("\n" + "=" * 60)
@@ -893,37 +1258,40 @@ def print_results(results: Dict):
     print("=" * 60)
 
     print(f"\nEmails Processed: {summary['total_processed']}")
-    print(f"  Promotional:     {summary['promotional_count']}")
-    print(f"  Non-Promotional: {summary['non_promotional_count']}")
+    print(f"\nEmails by Category:")
+    category_counts = summary.get('category_counts', {})
+    print(f"  Promotional:      {category_counts.get('promotional', 0)}")
+    print(f"  Transactional:    {category_counts.get('transactional', 0)}")
+    print(f"  System/Security:  {category_counts.get('system_security', 0)}")
+    print(f"  Social/Platform:  {category_counts.get('social_platform', 0)}")
+    print(f"  Personal/Human:   {category_counts.get('personal_human', 0)}")
 
     print(f"\nClassification Statistics:")
+    print(f"  Protected Domains:      {domain_stats.get('protected_hits', 0)}")
     print(f"  AI Classifications:     {stats['primary_calls']}")
     print(f"  AI Verifications:       {stats['verification_calls']}")
     print(f"  AI Corrections:         {stats['corrections']}")
-    print(f"  Keyword Matches:        {stats.get('keyword_hits', 0)}")
-    print(f"  Cache Hits:             {stats['cache_hits']}")
 
-    total_classified = stats['cache_hits'] + stats.get('keyword_hits', 0) + stats['primary_calls']
-    if total_classified > 0:
-        # Fast path = cache + keyword hits (no AI needed)
-        fast_path = stats['cache_hits'] + stats.get('keyword_hits', 0)
-        fast_rate = (fast_path / total_classified) * 100
-        print(f"  Fast Path Rate:         {fast_rate:.1f}% (cache + keywords)")
+    if stats['verification_calls'] > 0:
+        correction_rate = (stats['corrections'] /
+                          stats['verification_calls']) * 100
+        print(f"  Correction Rate:        {correction_rate:.1f}%")
 
-        if stats['verification_calls'] > 0:
-            correction_rate = (stats['corrections'] /
-                              stats['verification_calls']) * 100
-            print(f"  Correction Rate:        {correction_rate:.1f}%")
-
-    print(f"\nToken Usage:")
+    print(f"\nToken Usage ({cost.get('provider', 'unknown').title()}):")
     print(f"  Input:  {cost['input_tokens']:,} tokens ({cost['input_cost']})")
     print(f"  Output: {cost['output_tokens']:,} tokens ({cost['output_cost']})")
     print(f"  Total Cost: {cost['total_cost']}")
 
+    # Rate limit info
+    if stats.get('rate_limit_hits', 0) > 0:
+        print(f"\nRate Limiting:")
+        print(f"  Rate Limit Hits: {stats['rate_limit_hits']} (waited 60s each)")
+        print(f"  Total Wait Time: ~{stats['rate_limit_hits'] * 60 / 60:.1f} minutes")
+
     # Top senders
-    if summary['senders']:
+    if summary.get('promotional_senders'):
         print(f"\nTop 10 Promotional Senders:")
-        for i, (sender, data) in enumerate(list(summary['senders'].items())[:10]):
+        for i, (sender, data) in enumerate(list(summary['promotional_senders'].items())[:10]):
             print(f"  {i+1:2}. {sender}: {data['count']} emails "
                   f"({data['avg_confidence']:.0f}% avg confidence)")
 
@@ -938,8 +1306,12 @@ def main():
     parser.add_argument('--project-dir', '-d',
                         default='/Users/sidhartharora/dev/claude/email/gmail-classifier-project',
                         help='Project directory containing credentials')
+    parser.add_argument('--provider', '-p',
+                        choices=['gemini', 'anthropic'],
+                        default=AI_PROVIDER,
+                        help=f'AI provider (default: {AI_PROVIDER})')
     parser.add_argument('--api-key', '-k',
-                        help='Anthropic API key (or set ANTHROPIC_API_KEY env var)')
+                        help='API key (or set GEMINI_API_KEY/ANTHROPIC_API_KEY env var)')
     parser.add_argument('--max-emails', '-m', type=int, default=None,
                         help='Maximum emails to process (default: all)')
     parser.add_argument('--no-cache', action='store_true',
@@ -952,20 +1324,36 @@ def main():
                         help='Reset progress and start fresh')
     parser.add_argument('--summary-only', action='store_true',
                         help='Only show summary of previous run')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug logging (shows API calls and results)')
 
     args = parser.parse_args()
 
+    # Enable debug mode
+    if args.debug:
+        config.DEBUG = True
+        print("\n[DEBUG MODE ENABLED]")
+
     print_header()
 
-    # Get API key
-    api_key = args.api_key or os.environ.get('ANTHROPIC_API_KEY')
+    # Get API key based on provider
+    if args.api_key:
+        api_key = args.api_key
+    elif args.provider == 'gemini':
+        api_key = os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
+    else:
+        api_key = os.environ.get('ANTHROPIC_API_KEY')
+
     if not api_key:
-        print("ERROR: Anthropic API key required!")
-        print("Set ANTHROPIC_API_KEY environment variable or use --api-key flag")
+        env_var = 'GEMINI_API_KEY' if args.provider == 'gemini' else 'ANTHROPIC_API_KEY'
+        print(f"ERROR: {args.provider.title()} API key required!")
+        print(f"Set {env_var} environment variable or use --api-key flag")
         sys.exit(1)
 
+    print(f"  Using provider: {args.provider}")
+
     # Initialize classifier
-    classifier = GmailClassifier(args.project_dir, api_key)
+    classifier = GmailClassifier(args.project_dir, api_key, args.provider)
 
     # Handle reset
     if args.reset:
