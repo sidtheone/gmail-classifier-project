@@ -1,250 +1,514 @@
 """
-Decision Engine for Gmail Classifier - SAFETY-FIRST Deletion Logic.
-
-This module implements the CRITICAL safety checks that determine whether an email
-should be deleted. ALL criteria must be met before deletion is approved.
-
-DELETION CRITERIA (ALL must be true):
-1. Category == Promotional
-2. Verified == True (dual-agent verification completed)
-3. Confidence >= 90%
-4. NOT protected domain (banks, government, healthcare, investment platforms, etc.)
-5. NOT starred/important (manual user flags)
-
-This is the LAST LINE OF DEFENSE before deletion - every check must pass.
+Decision Engine - Multi-layered safety system for deletion decisions
+Implements 5 mandatory safety gates (ALL must pass for deletion)
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from dataclasses import dataclass
 from enum import Enum
 
+from config import (
+    EmailCategory,
+    ConfidenceLevel,
+    CONFIDENCE_THRESHOLDS,
+    get_confidence_level,
+)
+from domain_checker import DomainChecker, DomainCheckResult
 
-class EmailCategory(Enum):
-    """Email classification categories."""
-    PROMOTIONAL = "promotional"
-    TRANSACTIONAL = "transactional"
-    SYSTEM_SECURITY = "system_security"
-    SOCIAL_PLATFORM = "social_platform"
-    PERSONAL_HUMAN = "personal_human"
+
+class DeletionDecision(str, Enum):
+    """Final deletion decision"""
+    APPROVED = "approved"          # All gates passed - safe to delete
+    REJECTED = "rejected"          # Failed one or more gates - DO NOT delete
+    FLAGGED_FOR_REVIEW = "flagged" # Medium confidence - needs human review
 
 
 @dataclass
-class DeletionDecision:
-    """
-    Represents a deletion decision with full audit trail.
+class GateResult:
+    """Result of a single safety gate check"""
+    gate_number: int
+    gate_name: str
+    passed: bool
+    reason: str
 
-    Attributes:
-        should_delete: Final decision - True if ALL criteria passed
-        reasons: List of reasons why email SHOULD be deleted
-        blocks: List of reasons why email should NOT be deleted (blocking factors)
-        email_id: Gmail message ID
-        category: Classified category
-        confidence: Final confidence score
-        verified: Whether dual-agent verification was completed
-        is_protected_domain: Whether domain is protected
-        has_manual_flags: Whether user manually flagged (starred/important)
-        manual_flag_list: List of manual flags if any
-    """
-    should_delete: bool
-    reasons: List[str]
-    blocks: List[str]
+
+@dataclass
+class DeletionDecisionResult:
+    """Complete decision result with all gate checks"""
+    decision: DeletionDecision
     email_id: str
     category: EmailCategory
-    confidence: int
-    verified: bool
-    is_protected_domain: bool
-    has_manual_flags: bool
-    manual_flag_list: List[str]
-
-    def to_dict(self) -> Dict:
-        """Convert to dictionary for logging/serialization."""
-        return {
-            'should_delete': self.should_delete,
-            'reasons': self.reasons,
-            'blocks': self.blocks,
-            'email_id': self.email_id,
-            'category': self.category.value,
-            'confidence': self.confidence,
-            'verified': self.verified,
-            'is_protected_domain': self.is_protected_domain,
-            'has_manual_flags': self.has_manual_flags,
-            'manual_flag_list': self.manual_flag_list
-        }
+    confidence: float
+    confidence_level: ConfidenceLevel
+    gates: List[GateResult]
+    final_reason: str
+    metadata: Dict
 
 
 class DecisionEngine:
     """
-    SAFETY-FIRST decision engine for email deletion.
-
-    This class implements the critical safety logic that determines whether
-    an email should be deleted. It enforces ALL deletion criteria and provides
-    a full audit trail for every decision.
-
-    Statistics tracked:
-    - approved_for_deletion: Emails that passed ALL checks
-    - blocked_by_category: Not promotional
-    - blocked_by_verification: Not verified by dual-agent
-    - blocked_by_confidence: Confidence < 90%
-    - blocked_by_domain: Protected domain (banks, investment, etc.)
-    - blocked_by_manual_flags: User manually starred/flagged
+    Multi-layered safety system with 5 mandatory gates.
+    ALL gates must pass for email to be approved for deletion.
     """
 
-    # Minimum confidence threshold for deletion
-    MIN_CONFIDENCE_FOR_DELETION = 90
+    def __init__(
+        self,
+        domain_checker: DomainChecker,
+        confidence_threshold: float = 90.0,
+        enable_human_review: bool = True,
+    ):
+        """
+        Initialize decision engine.
 
-    def __init__(self):
-        """Initialize decision engine with empty stats."""
+        Args:
+            domain_checker: DomainChecker instance for protected domain checks
+            confidence_threshold: Minimum confidence for deletion (default 90%)
+            enable_human_review: Enable human review for medium confidence emails
+        """
+        self.domain_checker = domain_checker
+        self.confidence_threshold = confidence_threshold
+        self.enable_human_review = enable_human_review
+
+        # Statistics tracking
         self.stats = {
-            'total_evaluated': 0,
-            'approved_for_deletion': 0,
-            'blocked_by_category': 0,
-            'blocked_by_verification': 0,
-            'blocked_by_confidence': 0,
-            'blocked_by_domain': 0,
-            'blocked_by_manual_flags': 0
+            "total_processed": 0,
+            "approved": 0,
+            "rejected": 0,
+            "flagged": 0,
+            "gate_failures": {
+                "gate_1_category": 0,
+                "gate_2_verification": 0,
+                "gate_3_confidence": 0,
+                "gate_4_protected_domain": 0,
+                "gate_5_manual_flags": 0,
+            },
         }
 
-    def should_delete(
+    def evaluate(
         self,
         email_id: str,
-        classification: Dict,
-        is_protected_domain: bool,
-        has_manual_flags: bool,
-        manual_flag_list: Optional[List[str]] = None
-    ) -> DeletionDecision:
+        category: str,
+        confidence: float,
+        verified: bool,
+        from_address: str,
+        is_starred: bool = False,
+        is_important: bool = False,
+        metadata: Optional[Dict] = None,
+    ) -> DeletionDecisionResult:
         """
-        Determine if an email should be deleted.
-
-        ALL of these criteria must be true for deletion:
-        1. Category == Promotional
-        2. Verified == True
-        3. Confidence >= 90%
-        4. NOT protected domain
-        5. NOT starred/important
+        Evaluate email against all 5 safety gates.
 
         Args:
             email_id: Gmail message ID
-            classification: Classification result dict with keys:
-                - 'category': EmailCategory enum
-                - 'confidence': int (0-100)
-                - 'verified': bool
-            is_protected_domain: True if domain is protected
-            has_manual_flags: True if email is starred/important
-            manual_flag_list: List of manual flags (e.g., ['starred', 'important'])
+            category: AI-classified category
+            confidence: Confidence score (0-100)
+            verified: Whether classification passed dual-agent verification
+            from_address: Email sender address
+            is_starred: Whether email is starred in Gmail
+            is_important: Whether email is marked important in Gmail
+            metadata: Additional metadata for logging
 
         Returns:
-            DeletionDecision object with full audit trail
+            DeletionDecisionResult with complete gate evaluation
         """
-        self.stats['total_evaluated'] += 1
+        self.stats["total_processed"] += 1
 
-        # Extract classification data
-        category = classification.get('category')
-        confidence = classification.get('confidence', 0)
-        verified = classification.get('verified', False)
+        # Normalize category to EmailCategory enum
+        try:
+            email_category = EmailCategory(category.lower())
+        except ValueError:
+            # Invalid category - fail-safe to PERSONAL_HUMAN
+            email_category = EmailCategory.PERSONAL_HUMAN
 
-        # Convert string category to enum if needed
-        if isinstance(category, str):
-            try:
-                category = EmailCategory(category)
-            except ValueError:
-                category = EmailCategory.PERSONAL_HUMAN  # Safe default
+        # Determine confidence level
+        confidence_level = get_confidence_level(confidence)
 
-        reasons = []
-        blocks = []
+        gates: List[GateResult] = []
+        metadata = metadata or {}
 
-        # Check 1: Category must be Promotional
-        if category != EmailCategory.PROMOTIONAL:
-            blocks.append(f"Category is {category.value}, not promotional")
-            self.stats['blocked_by_category'] += 1
-        else:
-            reasons.append("Category is promotional")
+        # ====================================================================
+        # GATE 1: Category Check
+        # ====================================================================
+        gate_1 = self._check_gate_1_category(email_category)
+        gates.append(gate_1)
 
-        # Check 2: Must be verified by dual-agent
-        if not verified:
-            blocks.append("Not verified by dual-agent system")
-            self.stats['blocked_by_verification'] += 1
-        else:
-            reasons.append("Verified by dual-agent")
+        # ====================================================================
+        # GATE 2: Verification Check
+        # ====================================================================
+        gate_2 = self._check_gate_2_verification(verified)
+        gates.append(gate_2)
 
-        # Check 3: Confidence must be >= 90%
-        if confidence < self.MIN_CONFIDENCE_FOR_DELETION:
-            blocks.append(f"Confidence {confidence}% < {self.MIN_CONFIDENCE_FOR_DELETION}% threshold")
-            self.stats['blocked_by_confidence'] += 1
-        else:
-            reasons.append(f"High confidence ({confidence}%)")
+        # ====================================================================
+        # GATE 3: Confidence Threshold
+        # ====================================================================
+        gate_3 = self._check_gate_3_confidence(confidence, confidence_level)
+        gates.append(gate_3)
 
-        # Check 4: NOT protected domain
-        if is_protected_domain:
-            blocks.append("Protected domain (bank/government/investment/healthcare/utility/education)")
-            self.stats['blocked_by_domain'] += 1
-        else:
-            reasons.append("Not a protected domain")
+        # ====================================================================
+        # GATE 4: Protected Domain Check
+        # ====================================================================
+        gate_4 = self._check_gate_4_protected_domain(from_address)
+        gates.append(gate_4)
 
-        # Check 5: NOT starred/important
-        if has_manual_flags:
-            flag_str = ', '.join(manual_flag_list or ['unknown'])
-            blocks.append(f"Manually flagged by user ({flag_str})")
-            self.stats['blocked_by_manual_flags'] += 1
-        else:
-            reasons.append("No manual flags")
+        # Store domain check result in metadata
+        if hasattr(gate_4, 'domain_result'):
+            metadata['domain_check'] = gate_4.domain_result
 
-        # Final decision: ALL criteria must be met (no blocks)
-        should_delete = len(blocks) == 0
+        # ====================================================================
+        # GATE 5: Manual Flags Check
+        # ====================================================================
+        gate_5 = self._check_gate_5_manual_flags(is_starred, is_important)
+        gates.append(gate_5)
 
-        if should_delete:
-            self.stats['approved_for_deletion'] += 1
-
-        return DeletionDecision(
-            should_delete=should_delete,
-            reasons=reasons,
-            blocks=blocks,
-            email_id=email_id,
-            category=category,
-            confidence=confidence,
-            verified=verified,
-            is_protected_domain=is_protected_domain,
-            has_manual_flags=has_manual_flags,
-            manual_flag_list=manual_flag_list or []
+        # ====================================================================
+        # FINAL DECISION
+        # ====================================================================
+        decision, final_reason = self._make_final_decision(
+            gates, confidence_level, email_category
         )
 
+        # Update statistics
+        self._update_stats(decision, gates)
+
+        return DeletionDecisionResult(
+            decision=decision,
+            email_id=email_id,
+            category=email_category,
+            confidence=confidence,
+            confidence_level=confidence_level,
+            gates=gates,
+            final_reason=final_reason,
+            metadata=metadata,
+        )
+
+    # ========================================================================
+    # INDIVIDUAL GATE CHECKS
+    # ========================================================================
+
+    def _check_gate_1_category(self, category: EmailCategory) -> GateResult:
+        """
+        Gate 1: Email must be categorized as PROMOTIONAL.
+        Only promotional emails are eligible for deletion.
+        """
+        passed = category == EmailCategory.PROMOTIONAL
+
+        return GateResult(
+            gate_number=1,
+            gate_name="Category Check",
+            passed=passed,
+            reason=(
+                "Category is PROMOTIONAL"
+                if passed
+                else f"Category is {category.value}, not PROMOTIONAL"
+            ),
+        )
+
+    def _check_gate_2_verification(self, verified: bool) -> GateResult:
+        """
+        Gate 2: Classification must pass dual-agent verification.
+        Verifier agent must confirm promotional classification.
+        """
+        return GateResult(
+            gate_number=2,
+            gate_name="Verification Check",
+            passed=verified,
+            reason=(
+                "Passed dual-agent verification"
+                if verified
+                else "Failed dual-agent verification"
+            ),
+        )
+
+    def _check_gate_3_confidence(
+        self, confidence: float, confidence_level: ConfidenceLevel
+    ) -> GateResult:
+        """
+        Gate 3: Confidence must meet threshold.
+        Default threshold is 90% for auto-deletion.
+        Medium confidence (70-89%) triggers human review if enabled.
+        """
+        # For flagged reviews, we consider the gate "passed" for evaluation
+        # but the final decision will be FLAGGED, not APPROVED
+        if confidence_level == ConfidenceLevel.MEDIUM and self.enable_human_review:
+            return GateResult(
+                gate_number=3,
+                gate_name="Confidence Threshold",
+                passed=True,  # Technically passes, but will be flagged
+                reason=f"Medium confidence ({confidence:.1f}%) - flagged for human review",
+            )
+
+        passed = confidence >= self.confidence_threshold
+
+        return GateResult(
+            gate_number=3,
+            gate_name="Confidence Threshold",
+            passed=passed,
+            reason=(
+                f"Confidence {confidence:.1f}% >= threshold {self.confidence_threshold}%"
+                if passed
+                else f"Confidence {confidence:.1f}% < threshold {self.confidence_threshold}%"
+            ),
+        )
+
+    def _check_gate_4_protected_domain(self, from_address: str) -> GateResult:
+        """
+        Gate 4: Email must NOT be from protected domain.
+        Protected domains (banks, brokerages, government) bypass deletion entirely.
+        """
+        domain_result = self.domain_checker.check_domain(from_address)
+
+        passed = not domain_result.is_protected
+
+        gate = GateResult(
+            gate_number=4,
+            gate_name="Protected Domain Check",
+            passed=passed,
+            reason=(
+                "Not from protected domain"
+                if passed
+                else f"PROTECTED: {domain_result.reason}"
+            ),
+        )
+
+        # Attach domain result for metadata
+        gate.domain_result = domain_result
+
+        return gate
+
+    def _check_gate_5_manual_flags(
+        self, is_starred: bool, is_important: bool
+    ) -> GateResult:
+        """
+        Gate 5: Email must NOT have manual flags (starred/important).
+        User-flagged emails are never deleted.
+        """
+        has_flags = is_starred or is_important
+        passed = not has_flags
+
+        flags = []
+        if is_starred:
+            flags.append("starred")
+        if is_important:
+            flags.append("important")
+
+        return GateResult(
+            gate_number=5,
+            gate_name="Manual Flags Check",
+            passed=passed,
+            reason=(
+                "No manual flags"
+                if passed
+                else f"Has manual flags: {', '.join(flags)}"
+            ),
+        )
+
+    # ========================================================================
+    # FINAL DECISION LOGIC
+    # ========================================================================
+
+    def _make_final_decision(
+        self,
+        gates: List[GateResult],
+        confidence_level: ConfidenceLevel,
+        category: EmailCategory,
+    ) -> tuple[DeletionDecision, str]:
+        """
+        Make final deletion decision based on all gate results.
+
+        Args:
+            gates: List of all gate check results
+            confidence_level: Confidence level (HIGH/MEDIUM/LOW)
+            category: Email category
+
+        Returns:
+            Tuple of (decision, reason)
+        """
+        # Check if all gates passed
+        all_passed = all(gate.passed for gate in gates)
+
+        # Find failed gates
+        failed_gates = [gate for gate in gates if not gate.passed]
+
+        # CASE 1: One or more gates failed - REJECT
+        if not all_passed:
+            failed_gate_names = [gate.gate_name for gate in failed_gates]
+            return (
+                DeletionDecision.REJECTED,
+                f"Failed gates: {', '.join(failed_gate_names)}",
+            )
+
+        # CASE 2: All gates passed, but medium confidence - FLAG FOR REVIEW
+        if confidence_level == ConfidenceLevel.MEDIUM and self.enable_human_review:
+            return (
+                DeletionDecision.FLAGGED_FOR_REVIEW,
+                "All gates passed but confidence is medium (70-89%) - requires human review",
+            )
+
+        # CASE 3: All gates passed and high confidence - APPROVE
+        if confidence_level == ConfidenceLevel.HIGH:
+            return (
+                DeletionDecision.APPROVED,
+                "All 5 safety gates passed with high confidence",
+            )
+
+        # CASE 4: Low confidence - REJECT (should be caught by gate 3, but fail-safe)
+        return (
+            DeletionDecision.REJECTED,
+            "Low confidence (<70%) - not eligible for deletion",
+        )
+
+    # ========================================================================
+    # STATISTICS
+    # ========================================================================
+
+    def _update_stats(self, decision: DeletionDecision, gates: List[GateResult]):
+        """Update internal statistics"""
+        if decision == DeletionDecision.APPROVED:
+            self.stats["approved"] += 1
+        elif decision == DeletionDecision.REJECTED:
+            self.stats["rejected"] += 1
+        elif decision == DeletionDecision.FLAGGED_FOR_REVIEW:
+            self.stats["flagged"] += 1
+
+        # Track gate failures
+        for gate in gates:
+            if not gate.passed:
+                gate_key = f"gate_{gate.gate_number}_{gate.gate_name.lower().replace(' ', '_')}"
+                if gate_key in self.stats["gate_failures"]:
+                    self.stats["gate_failures"][gate_key] += 1
+
     def get_stats(self) -> Dict:
-        """
-        Get deletion decision statistics.
+        """Get decision engine statistics"""
+        stats = self.stats.copy()
 
-        Returns:
-            Dictionary with counts for each decision outcome
-        """
-        return self.stats.copy()
+        # Calculate percentages
+        total = stats["total_processed"]
+        if total > 0:
+            stats["approval_rate"] = (stats["approved"] / total) * 100
+            stats["rejection_rate"] = (stats["rejected"] / total) * 100
+            stats["flag_rate"] = (stats["flagged"] / total) * 100
 
-    def get_stats_summary(self) -> str:
-        """
-        Get human-readable statistics summary.
+        return stats
 
-        Returns:
-            Formatted string with statistics
-        """
-        total = self.stats['total_evaluated']
-        if total == 0:
-            return "No emails evaluated yet"
-
-        approved = self.stats['approved_for_deletion']
-        approval_rate = (approved / total * 100) if total > 0 else 0
-
-        lines = [
-            f"Deletion Decision Statistics:",
-            f"  Total evaluated:           {total}",
-            f"  Approved for deletion:     {approved} ({approval_rate:.1f}%)",
-            f"",
-            f"  Blocked by category:       {self.stats['blocked_by_category']}",
-            f"  Blocked by verification:   {self.stats['blocked_by_verification']}",
-            f"  Blocked by confidence:     {self.stats['blocked_by_confidence']}",
-            f"  Blocked by domain:         {self.stats['blocked_by_domain']}",
-            f"  Blocked by manual flags:   {self.stats['blocked_by_manual_flags']}"
-        ]
-
-        return '\n'.join(lines)
-
-    def reset_stats(self) -> None:
-        """Reset all statistics to zero."""
-        for key in self.stats:
+    def reset_stats(self):
+        """Reset statistics"""
+        for key in ["total_processed", "approved", "rejected", "flagged"]:
             self.stats[key] = 0
+
+        for gate in self.stats["gate_failures"]:
+            self.stats["gate_failures"][gate] = 0
+
+    def print_stats(self):
+        """Print formatted statistics"""
+        stats = self.get_stats()
+
+        print("\n" + "=" * 80)
+        print("DECISION ENGINE STATISTICS")
+        print("=" * 80)
+        print(f"Total Emails Processed: {stats['total_processed']}")
+        print()
+        print(f"Approved for Deletion:  {stats['approved']:4} ({stats.get('approval_rate', 0):5.1f}%)")
+        print(f"Rejected (Do Not Delete): {stats['rejected']:4} ({stats.get('rejection_rate', 0):5.1f}%)")
+        print(f"Flagged for Review:     {stats['flagged']:4} ({stats.get('flag_rate', 0):5.1f}%)")
+        print()
+        print("Gate Failure Breakdown:")
+
+        for gate_name, count in stats["gate_failures"].items():
+            if count > 0:
+                print(f"  {gate_name}: {count}")
+
+        print("=" * 80 + "\n")
+
+
+# ============================================================================
+# TESTING
+# ============================================================================
+
+if __name__ == "__main__":
+    from config import Market
+
+    # Create test decision engine
+    domain_checker = DomainChecker(Market.ALL)
+    engine = DecisionEngine(domain_checker, confidence_threshold=90.0)
+
+    # Test cases
+    test_cases = [
+        {
+            "name": "Safe promotional email - APPROVE",
+            "email_id": "test001",
+            "category": "promotional",
+            "confidence": 95.0,
+            "verified": True,
+            "from_address": "deals@onlineshop.com",
+            "is_starred": False,
+            "is_important": False,
+        },
+        {
+            "name": "Brokerage email - REJECT (protected domain)",
+            "email_id": "test002",
+            "category": "promotional",
+            "confidence": 95.0,
+            "verified": True,
+            "from_address": "alerts@zerodha.com",
+            "is_starred": False,
+            "is_important": False,
+        },
+        {
+            "name": "Medium confidence - FLAG FOR REVIEW",
+            "email_id": "test003",
+            "category": "promotional",
+            "confidence": 75.0,
+            "verified": True,
+            "from_address": "newsletter@company.com",
+            "is_starred": False,
+            "is_important": False,
+        },
+        {
+            "name": "Not promotional - REJECT (wrong category)",
+            "email_id": "test004",
+            "category": "transactional",
+            "confidence": 95.0,
+            "verified": True,
+            "from_address": "receipt@store.com",
+            "is_starred": False,
+            "is_important": False,
+        },
+        {
+            "name": "Starred email - REJECT (manual flag)",
+            "email_id": "test005",
+            "category": "promotional",
+            "confidence": 95.0,
+            "verified": True,
+            "from_address": "deals@shop.com",
+            "is_starred": True,
+            "is_important": False,
+        },
+    ]
+
+    print("\nTesting Decision Engine with 5-Gate Safety System")
+    print("=" * 80)
+
+    for test in test_cases:
+        print(f"\nTest: {test['name']}")
+        print("-" * 80)
+
+        result = engine.evaluate(
+            email_id=test["email_id"],
+            category=test["category"],
+            confidence=test["confidence"],
+            verified=test["verified"],
+            from_address=test["from_address"],
+            is_starred=test["is_starred"],
+            is_important=test["is_important"],
+        )
+
+        print(f"Decision: {result.decision.value.upper()}")
+        print(f"Reason: {result.final_reason}")
+        print("\nGate Results:")
+
+        for gate in result.gates:
+            status = "PASS" if gate.passed else "FAIL"
+            print(f"  Gate {gate.gate_number} ({gate.gate_name}): {status:4} - {gate.reason}")
+
+    # Print statistics
+    engine.print_stats()

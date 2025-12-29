@@ -1,11 +1,7 @@
-# Credentials and tokens (SENSITIVE!)
-credentials.json
+# Environment
+.env
 token.pickle
-
-# Runtime generated files
-classifier_progress.json
-sender_cache.json
-sender_summary.json
+credentials.json
 
 # Python
 __pycache__/
@@ -13,12 +9,26 @@ __pycache__/
 *$py.class
 *.so
 .Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
 venv/
 env/
-.env
-*.egg-info/
-dist/
-build/
+ENV/
 
 # IDE
 .vscode/
@@ -27,9 +37,23 @@ build/
 *.swo
 *~
 
+# Logs & Results
+logs/
+*.log
+classification_results/
+*.csv
+*.json.bak
+
+# Analysis outputs
+plots/
+*.png
+*.pdf
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
 # OS
 .DS_Store
 Thumbs.db
-
-# Logs
-*.log
